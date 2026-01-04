@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+# FreeBSD IP Blocklists Blocker
+# Author: Geovanni B.R. (geobarrod) <igeo.cu at gmail.com> - 2026-01-03
+#
+# ================================= Documentation ===========================================
+# Purpose:
+#   Downloads multiple external IP blocklists, merges them, sorts them, and loads them into
+#   a persistent pf table for automatic blocking of malicious sources.
+#   Dynamically adjusts net.pf.request_maxcount based on the number of IPs to prevent errors.
+#
+# Usage:
+#   sudo fbsd-ipbl-blocker {daemon|update|list|restore}
+#
+# Options:
+#   daemon    Run continuously, updating blocklists every 24 hours.
+#   update    Perform a one-time update of blocklists and reload pf.
+#   list      Show the current blocklist and count of IPs.
+#   restore   Restore the most recent pf.conf backup if needed.
+#
+# Configuration Variables:
+#   PF_TABLE       Name of the pf table (default: blocked_ips).
+#   PFCONF         Path to pf.conf (default: /etc/pf.conf).
+#   BACKUP_DIR     Directory for pf.conf backups (default: /etc).
+#   BLOCKLIST      Path to merged blocklist file (default: /etc/pf.blocked_ips).
+#   TMPFILE        Temporary file used during updates.
+#   LASTFILE       Snapshot of last blocklist to detect changes.
+#   SYSCTL_CONF    Path to sysctl.conf (default: /etc/sysctl.conf).
+#   URLS           List of external IP blocklist sources.
+#
+# Features:
+#   - Downloads multiple IP blocklists from trusted sources.
+#   - Extracts valid IPv4 addresses and sorts them numerically.
+#   - Ensures pf.conf contains a persistent table definition.
+#   - Dynamically adjusts net.pf.request_maxcount via sysctl with margin.
+#   - Updates /etc/sysctl.conf to persist net.pf.request_maxcount across reboots.
+#   - Reloads pf and replaces table contents with the latest IPs.
+#   - Runs as a daemon to refresh blocklists daily.
+#   - Provides backup and restore functionality for pf.conf.
+#
+# Requirements:
+#   - FreeBSD system with root privileges.
+#   - pf enabled and configured.
+#   - bash, fetch, grep, sort, uniq, wc, sed utilities available.
+#
+# ===========================================================================================
+
+PF_TABLE="blocked_ips"
+PFCONF="/etc/pf.conf"
+BACKUP_DIR="/etc"
+BLOCKLIST="/etc/pf.${PF_TABLE}"
+TMPFILE="/tmp/pf.${PF_TABLE}.tmp"
+LASTFILE="/tmp/pf.${PF_TABLE}.last"
+SYSCTL_CONF="/etc/sysctl.conf"
+
+URLS="
+http://www.ciarmy.com/list/ci-badguys.txt
+https://blocklist.greensnow.co/greensnow.txt
+https://danger.rulez.sk/projects/bruteforceblocker/blist.php
+https://lists.blocklist.de/lists/all.txt
+https://raw.githubusercontent.com/stamparm/ipsum/refs/heads/master/ipsum.txt
+"
+# Very big IP blocklist
+#https://raw.githubusercontent.com/bitwire-it/ipblocklist/refs/heads/main/ip-list.txt
+
+check_pf_table() {
+    if ! grep -q "table <${PF_TABLE}>" "$PFCONF"; then
+        cp "$PFCONF" "$BACKUP_DIR/pf.conf.$(date +%Y%m%d%H%M%S).bak"
+        {
+            echo ""
+            echo "# Table automatically added by fbsd-ipbl-blocker"
+            echo "table <${PF_TABLE}> persist"
+            echo "block in quick from <${PF_TABLE}>"
+        } >> "$PFCONF"
+    fi
+}
+
+update_lists() {
+    : > "$TMPFILE"
+    for url in $URLS; do
+        echo "Downloading $url..."
+        fetch -o - "$url" >> "$TMPFILE"
+    done
+
+    # Extract and sort unique IPs
+    echo "Extract and sort unique IPs..."
+    grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' "$TMPFILE" \
+        | sort -n -t . -k1,1 -k2,2 -k3,3 -k4,4 \
+        | uniq > "$BLOCKLIST"
+}
+
+ensure_sysctl_conf() {
+    limit=$1
+    if grep -q "^net.pf.request_maxcount" "$SYSCTL_CONF"; then
+        # Update existing line
+        sed -i '' "s/^net.pf.request_maxcount=.*/net.pf.request_maxcount=${limit}/" "$SYSCTL_CONF"
+    else
+        # Append new line
+        echo "net.pf.request_maxcount=${limit}" >> "$SYSCTL_CONF"
+    fi
+}
+
+adjust_pf_limit() {
+    count=$(wc -l < "$BLOCKLIST")
+    # Add 20% margin
+    limit=$(( count + (count / 5) ))
+    sysctl net.pf.request_maxcount=$limit >/dev/null
+    ensure_sysctl_conf "$limit"
+}
+
+reload_pf() {
+    cut -d' ' -f1 "$BLOCKLIST" > "$TMPFILE"
+    adjust_pf_limit
+    pfctl -t "$PF_TABLE" -T flush
+    pfctl -t "$PF_TABLE" -T add -f "$TMPFILE"
+    pfctl -f "$PFCONF"
+    rm -f "$TMPFILE"
+}
+
+daemon_loop() {
+    check_pf_table
+    while true; do
+        update_lists
+        if ! cmp -s "$BLOCKLIST" "$LASTFILE"; then
+            echo "Changes detected, updating pf table..."
+            cp "$BLOCKLIST" "$LASTFILE"
+            reload_pf
+        else
+            echo "No changes detected."
+        fi
+        sleep 86400
+    done
+}
+
+case "$1" in
+    daemon)
+        daemon_loop
+        ;;
+    update)
+        check_pf_table
+        update_lists
+        reload_pf
+        ;;
+    list)
+        cat "$BLOCKLIST"
+        wc -l "$BLOCKLIST"
+        ;;
+    restore)
+        latest_backup=$(ls -t $BACKUP_DIR/pf.conf.*.bak 2>/dev/null | head -n 1)
+        [ -n "$latest_backup" ] && cp "$latest_backup" "$PFCONF" && pfctl -f "$PFCONF"
+        ;;
+    *)
+        echo "Usage: $0 {daemon|update|list|restore}"
+        ;;
+esac
