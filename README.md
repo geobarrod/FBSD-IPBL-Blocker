@@ -81,7 +81,7 @@ sudo fbsd-ipbl-blocker restore
 Clone the repository and run the installer:
 ```sh
 git clone https://github.com/geobarrod/FBSD-IPBL-Blocker.git
-cd fbsd-ipbl-blocker
+cd FBSD-IPBL-Blocker
 sudo make install
 ```
 
@@ -90,7 +90,7 @@ sudo make install
 ## Uninstallation
 To remove the fbsd-ipbl-blocker and service:
 ```sh
-cd fbsd-ipbl-blocker
+cd FBSD-IPBL-Blocker
 sudo make uninstall
 ```
 
